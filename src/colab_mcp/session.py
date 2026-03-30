@@ -12,33 +12,38 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Extended version: adds notebook_id parameter to open specific Drive notebooks
-# instead of always opening the scratchpad.
+# Extended version: multi-session support with browser backend abstraction.
+
+from __future__ import annotations
 
 import asyncio
 from collections.abc import AsyncIterator
 import contextlib
 from contextlib import AsyncExitStack
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from enum import Enum
+import secrets
+from typing import TYPE_CHECKING
+
 from fastmcp import FastMCP, Client
 from fastmcp.client.transports import ClientTransport
-from fastmcp.dependencies import CurrentContext
-from fastmcp.server.context import Context
-from fastmcp.server.middleware import Middleware, MiddlewareContext
-from fastmcp.server.middleware.tool_injection import ToolInjectionMiddleware
 from fastmcp.server.proxy import FastMCPProxy
-from fastmcp.tools.tool import Tool, ToolResult
 from mcp.client.session import ClientSession
-from mcp.types import TextContent
-import webbrowser
 
-from colab_mcp.websocket_server import ColabWebSocketServer, COLAB, SCRATCH_PATH
+from colab_mcp.websocket_server import ColabWebSocketServer
+
+if TYPE_CHECKING:
+    from colab_mcp.browser.base import BrowserBackend
 
 UI_CONNECTION_TIMEOUT = 60.0  # secs
 
-FE_CONNECTED_KEY = "fe_connected"
-PROXY_TOKEN_KEY = "proxy_token"
-PROXY_PORT_KEY = "proxy_port"
-INJECTED_TOOL_NAME = "open_colab_browser_connection"
+
+class SessionStatus(Enum):
+    CONNECTING = "connecting"
+    CONNECTED = "connected"
+    DISCONNECTED = "disconnected"
+    ERROR = "error"
 
 
 class ColabTransport(ClientTransport):
@@ -53,7 +58,7 @@ class ColabTransport(ClientTransport):
             yield session
 
     def __repr__(self) -> str:
-        return "<ColabSessionProxyTransport>"
+        return "<ColabTransport>"
 
 
 class ColabProxyClient:
@@ -67,25 +72,22 @@ class ColabProxyClient:
     def is_connected(self):
         return self.wss.connection_live.is_set() and self.proxy_mcp_client is not None
 
-    async def await_proxy_connection(self):
-        with contextlib.suppress(asyncio.TimeoutError):
-            # wait for the connection to be live and for the proxy client to fully initialize
-            connection_tasks = asyncio.gather(
-                self.wss.connection_live.wait(), self._start_task
-            )
+    async def await_proxy_connection(self, timeout: float = UI_CONNECTION_TIMEOUT) -> bool:
+        try:
             await asyncio.wait_for(
-                connection_tasks,
-                timeout=UI_CONNECTION_TIMEOUT,
+                asyncio.gather(self.wss.connection_live.wait(), self._start_task),
+                timeout=timeout,
             )
+            return True
+        except (asyncio.TimeoutError, asyncio.CancelledError):
+            return False
 
     def client_factory(self):
         if self.is_connected():
             return self.proxy_mcp_client
-        # return a client mapped to a stubbed mcp server if there is no session proxy
         return self.stubbed_mcp_client
 
     async def _start_proxy_client(self):
-        # blocks until a websocket connection is made successfully
         self.proxy_mcp_client = await self._exit_stack.enter_async_context(
             Client(ColabTransport(self.wss))
         )
@@ -100,137 +102,89 @@ class ColabProxyClient:
         await self._exit_stack.aclose()
 
 
-class ColabProxyMiddleware(Middleware):
-    def __init__(self, proxy_client: ColabProxyClient):
-        self.proxy_client = proxy_client
-        self.last_message_connected = self.proxy_client.is_connected()
-
-    async def on_message(self, context: MiddlewareContext, call_next):
-        """
-        Check for a change to Colab session connectivity on any communication with this MCP server and
-        notify the client when the connectivity status has changed.
-        """
-        context.fastmcp_context.set_state(
-            FE_CONNECTED_KEY, self.proxy_client.is_connected()
-        )
-        context.fastmcp_context.set_state(PROXY_TOKEN_KEY, self.proxy_client.wss.token)
-        context.fastmcp_context.set_state(PROXY_PORT_KEY, self.proxy_client.wss.port)
-
-        result = await call_next(context)
-
-        connected = self.proxy_client.is_connected()
-        connection_state_changed = connected != self.last_message_connected
-        self.last_message_connected = connected
-        if connection_state_changed:
-            await context.fastmcp_context.send_tool_list_changed()
-
-        return result
-
-    async def on_call_tool(self, context, call_next):
-        result = await call_next(context)
-        if context.message.name != INJECTED_TOOL_NAME:
-            return result
-        if self.proxy_client.is_connected():
-            return result
-        # if the tool call was for open_colab_browser_connection and there is no existing connection, try to await full connection
-        await context.fastmcp_context.report_progress(
-            progress=1, total=3, message="The user is not connected to the Colab UI"
-        )
-        await context.fastmcp_context.report_progress(
-            progress=2,
-            total=3,
-            message="Waiting for user to connect in Colab - will wait for 60s",
-        )
-        await self.proxy_client.await_proxy_connection()
-        if self.proxy_client.is_connected():
-            await context.fastmcp_context.report_progress(
-                progress=3, total=3, message="The Colab UI is successfully connected!"
-            )
-            return ToolResult(
-                content=[TextContent(type="text", text="true")],
-                structured_content={"result": True},
-            )
-        else:
-            await context.fastmcp_context.report_progress(
-                progress=3,
-                total=3,
-                message="Timeout while waiting for the user to connect.",
-            )
-            return ToolResult(
-                content=[TextContent(type="text", text="false")],
-                structured_content={"result": False},
-            )
+@dataclass
+class SessionInfo:
+    """Serializable session metadata."""
+    session_id: str
+    notebook_id: str | None
+    authuser: int
+    status: str
+    created_at: str
 
 
-async def check_session_proxy_tool_fn(
-    notebook_id: str | None = None,
-    authuser: int = 1,
-    ctx: Context = CurrentContext(),
-) -> bool:
-    """Opens a connection to a Google Colab browser session and unlocks notebook editing tools.
+class ColabSession:
+    """A single Colab notebook session with its own WSS + proxy client stack."""
 
-    Args:
-        notebook_id: Optional Google Drive file ID of the notebook to open.
-                     If provided, opens that specific notebook instead of a blank scratchpad.
-                     You can get this from a Drive URL: drive.google.com/file/d/{THIS_PART}/...
-        authuser: Google account index to use (default 1). Use 0 for primary account,
-                  1 for secondary, etc.
+    def __init__(
+        self,
+        session_id: str | None = None,
+        notebook_id: str | None = None,
+        authuser: int = 1,
+    ):
+        self.session_id = session_id or secrets.token_urlsafe(6)
+        self.notebook_id = notebook_id
+        self.authuser = authuser
+        self.status = SessionStatus.DISCONNECTED
+        self.created_at = datetime.now(timezone.utc)
 
-    Returns:
-        True if the connection attempt succeeded, False otherwise.
-    """
-    fe_connected = ctx.get_state(FE_CONNECTED_KEY)
-    token = ctx.get_state(PROXY_TOKEN_KEY)
-    port = ctx.get_state(PROXY_PORT_KEY)
-    if fe_connected:
-        return True
-
-    # Build the notebook path
-    if notebook_id:
-        # Open a specific Drive notebook
-        path = f"/drive/{notebook_id}"
-    else:
-        # Fall back to scratchpad
-        path = SCRATCH_PATH
-
-    url = f"{COLAB}{path}?authuser={authuser}#mcpProxyToken={token}&mcpProxyPort={port}"
-    webbrowser.open_new(url)
-    return False
-
-
-check_session_proxy_tool = Tool.from_function(
-    fn=check_session_proxy_tool_fn,
-    name=INJECTED_TOOL_NAME,
-    description=(
-        "Opens a connection to a Google Colab browser session and unlocks notebook editing tools. "
-        "Returns a boolean representing whether the connection attempt succeeded. "
-        "Pass a notebook_id (Google Drive file ID) to open a specific notebook instead of a blank scratchpad."
-    ),
-)
-
-
-class ColabSessionProxy:
-    def __init__(self):
         self._exit_stack = AsyncExitStack()
-        self.proxy_server: FastMCPProxy | None = None
-        # list order matters, see: https://gofastmcp.com/servers/middleware#multiple-middleware
-        self.middleware: list[Middleware] = []
         self.wss: ColabWebSocketServer | None = None
+        self.proxy_client: ColabProxyClient | None = None
+        self.proxy_server: FastMCPProxy | None = None
+        self.backend: BrowserBackend | None = None
 
-    async def start_proxy_server(self):
+    @property
+    def info(self) -> SessionInfo:
+        return SessionInfo(
+            session_id=self.session_id,
+            notebook_id=self.notebook_id,
+            authuser=self.authuser,
+            status=self.status.value,
+            created_at=self.created_at.isoformat(),
+        )
+
+    def is_connected(self) -> bool:
+        return self.proxy_client is not None and self.proxy_client.is_connected()
+
+    async def start(self):
+        """Initialize the WSS + proxy client stack."""
+        self.status = SessionStatus.CONNECTING
         self.wss = await self._exit_stack.enter_async_context(ColabWebSocketServer())
-        proxy_client = await self._exit_stack.enter_async_context(
+        self.proxy_client = await self._exit_stack.enter_async_context(
             ColabProxyClient(self.wss)
         )
         self.proxy_server = FastMCPProxy(
-            client_factory=proxy_client.client_factory,
-            instructions="Connects to a user's Google Colab session in a browser and allows for interactions with their Google Colab notebook",
-        )
-        # ColabProxyMiddleware must be first because it sets the fe_connected state
-        self.middleware.append(ColabProxyMiddleware(proxy_client))
-        self.middleware.append(
-            ToolInjectionMiddleware(tools=[check_session_proxy_tool])
+            client_factory=self.proxy_client.client_factory,
+            instructions=f"Colab session {self.session_id} "
+            f"(notebook: {self.notebook_id or 'scratchpad'})",
         )
 
+    async def await_connection(self, timeout: float = UI_CONNECTION_TIMEOUT):
+        """Wait for the browser frontend to connect via WebSocket."""
+        if self.proxy_client:
+            await self.proxy_client.await_proxy_connection(timeout=timeout)
+        if self.is_connected():
+            self.status = SessionStatus.CONNECTED
+        else:
+            self.status = SessionStatus.DISCONNECTED
+
+    def get_colab_url(self) -> str:
+        """Build the Colab URL with proxy connection parameters."""
+        from colab_mcp.websocket_server import COLAB, SCRATCH_PATH
+
+        if self.notebook_id:
+            path = f"/drive/{self.notebook_id}"
+        else:
+            path = SCRATCH_PATH
+
+        token = self.wss.token if self.wss else ""
+        port = self.wss.port if self.wss else 0
+        return f"{COLAB}{path}?authuser={self.authuser}#mcpProxyToken={token}&mcpProxyPort={port}"
+
     async def cleanup(self):
+        """Tear down all resources."""
+        self.status = SessionStatus.DISCONNECTED
+        if self.backend:
+            await self.backend.close()
+            self.backend = None
         await self._exit_stack.aclose()
