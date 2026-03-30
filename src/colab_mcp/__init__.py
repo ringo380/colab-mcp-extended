@@ -20,12 +20,43 @@ import tempfile
 import sys
 
 from fastmcp import FastMCP
+from fastmcp.server.middleware import Middleware, MiddlewareContext
+from fastmcp.server.middleware.tool_injection import ToolInjectionMiddleware
 from fastmcp.utilities import logging as fastmcp_logger
 
-from colab_mcp.session import ColabSessionProxy
+from colab_mcp.session_manager import SessionManager
+from colab_mcp.tools.connection import get_connection_tools
+from colab_mcp.tools.execution import get_execution_tools
+from colab_mcp.tools.files import get_file_tools
+from colab_mcp.tools.notebook import get_notebook_tools
 
 
 mcp = FastMCP(name="ColabMCP")
+
+
+class SessionProxyMiddleware(Middleware):
+    """Routes proxied tool calls to the active session's proxy server."""
+
+    def __init__(self, session_manager: SessionManager):
+        self.session_manager = session_manager
+        self._last_connected: dict[str, bool] = {}
+
+    async def on_message(self, context: MiddlewareContext, call_next):
+        # Track connection state changes across all sessions
+        result = await call_next(context)
+
+        for session in self.session_manager.sessions.values():
+            was_connected = self._last_connected.get(session.session_id, False)
+            is_connected = session.is_connected()
+            if is_connected != was_connected:
+                self._last_connected[session.session_id] = is_connected
+                try:
+                    await context.fastmcp_context.send_tool_list_changed()
+                except Exception:
+                    logging.debug("Could not send tool list changed notification", exc_info=True)
+                break
+
+        return result
 
 
 def init_logger(logdir):
@@ -36,7 +67,7 @@ def init_logger(logdir):
         format="%(asctime)s %(levelname)s:%(message)s",
         datefmt="%m/%d/%Y %I:%M:%S %p",
         filename=log_filename,
-        level=logging.INFO,  # Set the minimum logging level to capture
+        level=logging.INFO,
     )
     fastmcp_logger.get_logger("colab-mcp").info("logging to %s" % log_filename)
 
@@ -54,11 +85,10 @@ def parse_args(v):
         default=tempfile.mkdtemp(prefix="colab-mcp-logs-"),
     )
     parser.add_argument(
-        "-p",
-        "--enable-proxy",
-        help="if set, enable the runtime proxy (enabled by default).",
-        action="store_true",
-        default=True,
+        "--browser-profile",
+        help="Path to Chromium user data directory for persistent auth in headless mode.",
+        action="store",
+        default=None,
     )
     return parser.parse_args(v)
 
@@ -67,20 +97,26 @@ async def main_async():
     args = parse_args(sys.argv[1:])
     init_logger(args.log)
 
-    if args.enable_proxy:
-        logging.info("enabling session proxy tools")
-        session_mcp = ColabSessionProxy()
-        await session_mcp.start_proxy_server()
-        mcp.mount(session_mcp.proxy_server)
-        for middleware in session_mcp.middleware:
-            mcp.add_middleware(middleware)
+    session_manager = SessionManager()
+    logging.info("Session manager initialized")
+
+    # Register all tools
+    all_tools = (
+        get_connection_tools(session_manager)
+        + get_execution_tools(session_manager)
+        + get_notebook_tools(session_manager)
+        + get_file_tools(session_manager)
+    )
+    mcp.add_middleware(SessionProxyMiddleware(session_manager))
+    mcp.add_middleware(ToolInjectionMiddleware(tools=all_tools))
+
+    # Start keepalive loop for headless sessions
+    await session_manager.start_keepalive_loop()
 
     try:
         await mcp.run_async()
-
     finally:
-        if args.enable_proxy:
-            await session_mcp.cleanup()
+        await session_manager.cleanup()
 
 
 def main() -> None:
