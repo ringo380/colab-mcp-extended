@@ -14,9 +14,10 @@ if TYPE_CHECKING:
 class SessionManager:
     """Manages multiple concurrent Colab notebook sessions."""
 
-    def __init__(self):
+    def __init__(self, default_browser_profile: str | None = None):
         self.sessions: dict[str, ColabSession] = {}
         self.active_session_id: str | None = None
+        self.default_browser_profile = default_browser_profile
         self._keepalive_task: asyncio.Task | None = None
 
     async def create_session(
@@ -33,15 +34,19 @@ class SessionManager:
             authuser: Google account index (0=primary, 1=secondary, etc.).
             headless: If True, use Playwright headless browser.
             browser_profile: Path to Chromium user data dir for persistent auth.
+                             Falls back to default_browser_profile from CLI.
 
         Returns:
             The created ColabSession.
         """
+        # Use explicit browser_profile, fall back to CLI default
+        effective_profile = browser_profile or self.default_browser_profile
+
         session = ColabSession(notebook_id=notebook_id, authuser=authuser)
         try:
             await session.start()
 
-            backend = await self._create_backend(headless, browser_profile)
+            backend = await self._create_backend(headless, effective_profile)
             session.backend = backend
 
             self.sessions[session.session_id] = session
@@ -101,19 +106,24 @@ class SessionManager:
 
     async def close_session(self, session_id: str) -> None:
         """Close and remove a session."""
-        session = self.sessions.pop(session_id, None)
-        if session is None:
+        if session_id not in self.sessions:
             raise KeyError(f"Session {session_id} not found")
 
-        await session.cleanup()
-        logging.info(f"Session {session_id} closed")
+        session = self.sessions[session_id]
 
-        # If we closed the active session, pick another or clear
-        if self.active_session_id == session_id:
-            if self.sessions:
-                self.active_session_id = next(iter(self.sessions))
-            else:
-                self.active_session_id = None
+        # Clean up resources before removing from tracking dict
+        try:
+            await session.cleanup()
+        finally:
+            self.sessions.pop(session_id, None)
+            logging.info(f"Session {session_id} closed")
+
+            # If we closed the active session, pick another or clear
+            if self.active_session_id == session_id:
+                if self.sessions:
+                    self.active_session_id = next(iter(self.sessions))
+                else:
+                    self.active_session_id = None
 
     def set_active(self, session_id: str) -> None:
         """Set the active session."""

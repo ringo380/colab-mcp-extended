@@ -12,12 +12,26 @@ from mcp.types import TextContent
 if TYPE_CHECKING:
     from colab_mcp.session_manager import SessionManager
 
+# Unique delimiters to isolate our output from other kernel noise
+_OUTPUT_START = "___COLAB_MCP_OUTPUT_START___"
+_OUTPUT_END = "___COLAB_MCP_OUTPUT_END___"
+
 
 def _extract_text(result) -> str:
     """Extract text content from an MCP tool result."""
     if isinstance(result, list):
         return "".join(c.text for c in result if isinstance(c, TextContent))
     return str(result)
+
+
+def _extract_delimited(raw: str) -> str:
+    """Extract content between output delimiters, ignoring surrounding noise."""
+    start = raw.find(_OUTPUT_START)
+    end = raw.find(_OUTPUT_END)
+    if start != -1 and end != -1:
+        return raw[start + len(_OUTPUT_START):end].strip()
+    # Fallback: return stripped raw text
+    return raw.strip()
 
 
 def get_file_tools(session_manager: SessionManager) -> list[Tool]:
@@ -131,10 +145,9 @@ print(json.dumps(info))
         data = base64.b64encode(file_bytes).decode()
 
         # Use json.dumps for safe string escaping to prevent code injection
-        safe_dest = json.dumps(dest)
         code = f"""
-import base64, json
-dest = json.loads({json.dumps(safe_dest)})
+import base64
+dest = {json.dumps(dest)}
 data = base64.b64decode("{data}")
 with open(dest, "wb") as f:
     f.write(data)
@@ -171,14 +184,15 @@ print(f"Uploaded {{len(data)}} bytes to {{dest}}")
         if not session.is_connected():
             return json.dumps({"error": f"Session {session.session_id} is not connected"})
 
-        # Use json.dumps for safe string escaping
-        safe_remote = json.dumps(remote_path)
+        # Use delimiters to isolate base64 output from any kernel noise
         code = f"""
-import base64, json
-path = json.loads({json.dumps(safe_remote)})
+import base64
+path = {json.dumps(remote_path)}
 with open(path, "rb") as f:
     data = base64.b64encode(f.read()).decode()
+print("{_OUTPUT_START}")
 print(data)
+print("{_OUTPUT_END}")
 """
         try:
             client = session.proxy_client.client_factory()
@@ -187,7 +201,8 @@ print(data)
             import base64
             from pathlib import Path
 
-            result_str = _extract_text(result).strip()
+            raw = _extract_text(result)
+            result_str = _extract_delimited(raw)
             file_data = base64.b64decode(result_str)
             dest = Path(local_path)
             dest.parent.mkdir(parents=True, exist_ok=True)

@@ -35,26 +35,57 @@ mcp = FastMCP(name="ColabMCP")
 
 
 class SessionProxyMiddleware(Middleware):
-    """Routes proxied tool calls to the active session's proxy server."""
+    """Tracks session connection state and mounts/unmounts proxy servers.
 
-    def __init__(self, session_manager: SessionManager):
+    When a session connects or disconnects, notifies the MCP client so it
+    can refresh its tool list. Mounts the active session's proxy_server
+    to expose Colab's native MCP tools.
+    """
+
+    def __init__(self, session_manager: SessionManager, mcp_server: FastMCP):
         self.session_manager = session_manager
+        self.mcp_server = mcp_server
         self._last_connected: dict[str, bool] = {}
+        self._mounted_session_id: str | None = None
+
+    def _update_mounted_proxy(self):
+        """Mount/unmount the active session's proxy_server on the MCP server."""
+        active = self.session_manager.get_active_session()
+        target_id = active.session_id if active and active.is_connected() else None
+
+        if target_id == self._mounted_session_id:
+            return  # Already mounted correctly
+
+        # Unmount previous proxy if any
+        if self._mounted_session_id is not None:
+            prev = self.session_manager.sessions.get(self._mounted_session_id)
+            if prev and prev.proxy_server and prev.proxy_server in self.mcp_server._proxy_servers:
+                self.mcp_server._proxy_servers.remove(prev.proxy_server)
+            self._mounted_session_id = None
+
+        # Mount new active proxy
+        if active and active.is_connected() and active.proxy_server:
+            self.mcp_server._proxy_servers.append(active.proxy_server)
+            self._mounted_session_id = active.session_id
 
     async def on_message(self, context: MiddlewareContext, call_next):
-        # Track connection state changes across all sessions
         result = await call_next(context)
 
-        for session in self.session_manager.sessions.values():
+        # Check for connection state changes across all sessions
+        changed = False
+        for session in list(self.session_manager.sessions.values()):
             was_connected = self._last_connected.get(session.session_id, False)
             is_connected = session.is_connected()
             if is_connected != was_connected:
                 self._last_connected[session.session_id] = is_connected
-                try:
-                    await context.fastmcp_context.send_tool_list_changed()
-                except Exception:
-                    logging.debug("Could not send tool list changed notification", exc_info=True)
-                break
+                changed = True
+
+        if changed:
+            self._update_mounted_proxy()
+            try:
+                await context.fastmcp_context.send_tool_list_changed()
+            except Exception:
+                logging.debug("Could not send tool list changed notification", exc_info=True)
 
         return result
 
@@ -67,7 +98,7 @@ def init_logger(logdir):
         format="%(asctime)s %(levelname)s:%(message)s",
         datefmt="%m/%d/%Y %I:%M:%S %p",
         filename=log_filename,
-        level=logging.INFO,
+        level=logging.INFO,  # Minimum logging level to capture
     )
     fastmcp_logger.get_logger("colab-mcp").info("logging to %s" % log_filename)
 
@@ -97,17 +128,18 @@ async def main_async():
     args = parse_args(sys.argv[1:])
     init_logger(args.log)
 
-    session_manager = SessionManager()
+    session_manager = SessionManager(default_browser_profile=args.browser_profile)
     logging.info("Session manager initialized")
 
     # Register all tools
+    # Middleware order matters: https://gofastmcp.com/servers/middleware#multiple-middleware
     all_tools = (
         get_connection_tools(session_manager)
         + get_execution_tools(session_manager)
         + get_notebook_tools(session_manager)
         + get_file_tools(session_manager)
     )
-    mcp.add_middleware(SessionProxyMiddleware(session_manager))
+    mcp.add_middleware(SessionProxyMiddleware(session_manager, mcp))
     mcp.add_middleware(ToolInjectionMiddleware(tools=all_tools))
 
     # Start keepalive loop for headless sessions

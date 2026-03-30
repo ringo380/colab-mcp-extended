@@ -5,6 +5,8 @@ from __future__ import annotations
 import json
 from typing import TYPE_CHECKING
 
+from fastmcp.dependencies import CurrentContext
+from fastmcp.server.context import Context
 from fastmcp.tools.tool import Tool
 
 if TYPE_CHECKING:
@@ -18,6 +20,8 @@ def get_connection_tools(session_manager: SessionManager) -> list[Tool]:
         notebook_id: str | None = None,
         authuser: int = 1,
         headless: bool = False,
+        browser_profile: str | None = None,
+        ctx: Context = CurrentContext(),
     ) -> str:
         """Open a new Google Colab session and connect to it.
 
@@ -28,18 +32,40 @@ def get_connection_tools(session_manager: SessionManager) -> list[Tool]:
             authuser: Google account index (default 1). Use 0 for primary, 1 for secondary.
             headless: If True, use headless browser automation (requires playwright).
                       If False (default), opens in your default browser.
+            browser_profile: Path to Chromium user data dir for persistent auth.
+                             Overrides the --browser-profile CLI default.
 
         Returns:
             JSON with session_id and connection status.
         """
+        await ctx.report_progress(
+            progress=1, total=3, message="Creating Colab session..."
+        )
+
         session = await session_manager.create_session(
             notebook_id=notebook_id,
             authuser=authuser,
             headless=headless,
+            browser_profile=browser_profile,
+        )
+
+        await ctx.report_progress(
+            progress=2, total=3,
+            message="Waiting for browser to connect to Colab (up to 60s)...",
         )
 
         # Wait for the frontend to connect
         await session.await_connection()
+
+        if session.is_connected():
+            await ctx.report_progress(
+                progress=3, total=3, message="Colab session connected!"
+            )
+        else:
+            await ctx.report_progress(
+                progress=3, total=3,
+                message="Timeout waiting for browser connection.",
+            )
 
         return json.dumps({
             "session_id": session.session_id,
